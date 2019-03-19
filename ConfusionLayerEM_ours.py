@@ -11,7 +11,7 @@ import NN_extended
 from utils import compute_confusion_matrices, compute_posteriors_Estep
 
 
-class Ours(object):
+class model(object):
 
     def __init__(self, model, sess):
 
@@ -61,7 +61,7 @@ class Ours(object):
         """Computing confusion matrix for a single data point
         """
 
-        conf_mats = np.range((self.c, self.c, self.K))
+        conf_mats = np.zeros((self.c, self.c, self.K))
         for k in range(self.K):
             for ell in range(self.c):
                 head_k_ell = self.model.branches['labeler_{}{}'.format(k,ell)]
@@ -169,6 +169,7 @@ class Ours(object):
         if test_dat_gen is not None:
             rep_test_gen = tee(test_dat_gen, EM_iter)
         eval_accs = []
+        t0 = self.t
         for t in range(self.t, self.t+EM_iter):
             # E-step
             # we do not do this step explicitly, but save
@@ -188,7 +189,8 @@ class Ours(object):
 
             if test_dat_gen is not None:
                 eval_accs += [eval_model(self.model,self.sess,
-                                         rep_test_gen[t-self.t])[0]]
+                                         rep_test_gen[t-t0])[0]]
+                print(eval_accs)
 
         return eval_accs
 
@@ -206,5 +208,3 @@ def eval_model(model,sess,dat_gen):
 
     return acc, preds
             
-
-
