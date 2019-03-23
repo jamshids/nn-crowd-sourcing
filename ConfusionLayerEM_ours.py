@@ -64,7 +64,7 @@ class model(object):
         conf_mats = np.zeros((self.c, self.c, self.K))
         for k in range(self.K):
             for ell in range(self.c):
-                head_k_ell = self.model.branches['labeler_{}{}'.format(k,ell)]
+                head_k_ell = self.aux_model.branches['labeler_{}{}'.format(k,ell)]
                 pi_jell_k = self.sess.run(head_k_ell.posteriors, 
                                           feed_dict={head_k_ell.x: single_x})
                 conf_mats[:,ell,k] = np.squeeze(pi_jell_k)
@@ -74,7 +74,7 @@ class model(object):
     def compute_Estep_posteriors(self, Xb, Zb, conf_mats=None):
         
         # priors
-        pies = self.sess.run(self.model.posteriors, 
+        pies = self.sess.run(self.aux_model.posteriors, 
                              feed_dict={self.model.x:Xb})
         E_posts = np.zeros((self.c, pies.shape[1]))
         for i in range(pies.shape[1]):
