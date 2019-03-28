@@ -1,4 +1,5 @@
 from itertools import tee
+import tensorflow as tf
 import numpy as np
 import sys
 import os
@@ -6,20 +7,106 @@ import os
 curr_path = os.getcwd()
 NN_model_path = os.path.join(os.path.dirname(curr_path), 'nn-active-learning')
 sys.path.insert(0, NN_model_path)
-
 import NN_extended
-from utils import compute_confusion_matrices, compute_posteriors_Estep
-
 
 class model(object):
 
-    def __init__(self, model, sess):
+    def __init__(self, model, sess, name=None):
 
         self.K = int(len(model.branches) / model.class_num)
         self.c = model.class_num
         self.t = 0      # EM iteration index
         self.model = model
         self.sess  = sess
+        self.name=name
+        if name is None:
+            self.name = model.name + '_ConfLayer'
+
+
+    def get_optimizer(self, PN_start_layer=None):
+
+
+        # start by collecting parameters of the prior-net
+        # based on the layer from which multiple annotator branches
+        # are extracted from
+        if PN_start_layer is None:
+            # assuming that there is only one probe at the
+            # input of the prior-net
+            probed_inputs = self.model.probes[0]
+            assert len(probed_inputs)==1, 'There is ambiguity in'+\
+                ' detecting the first layer of PN.'
+            PN_start_layer = list(probed_inputs.keys())[0]
+        
+        # take all the layers after the starting layer as the 
+        # PN ---  for now assume we want to add ALL these layers
+        # into the training part
+        self.train_vars = []
+        layers_w_pars = list(self.model.var_dict.keys())
+        for i, layer in enumerate(self.model.layer_dict):
+            # we still have not reached the beginning of PN,
+            # just continue
+            if PN_start_layer not in layers_w_pars[:i+1]:
+                continue
+
+            self.train_vars += [V for V in self.model.var_dict[layer] if V in
+                                tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)]
+
+        # collect all the head losses and sum them up
+        # also collect parameters of all the heads
+        self.loss = [self.model.loss]
+        for k in range(self.K):
+            for ell in range(self.c):
+                head_k_ell = self.model.branches['labeler_{}{}'.format(k,ell)]
+                # each head loss is equal to the weighted cross-entropy of
+                # the second term in ther M-step's objective
+                self.loss += [head_k_ell.loss]
+                for _,Vars in head_k_ell.var_dict.items():
+                    self.train_vars += [V for V in Vars if V in
+                                        tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)]
+        self.loss = tf.reduce_sum(self.loss)
+
+        # now construct the train step and optimizer using parameters 
+        # set in the main body model
+        with tf.variable_scope(self.name):
+            self.global_step = tf.Variable(0, trainable=False, 
+                                           name='global_step')
+
+            if self.model.optimizer_name=='SGD':
+                self.optimizer = tf.train.GradientDescentOptimizer(
+                    self.model.learning_rate)
+            elif self.model.optimizer_name=='Adam':
+                self.optimizer = tf.train.AdamOptimizer(
+                    self.model.learning_rate, 
+                    self.model.beta1, 
+                    self.model.beta2)
+            elif self.model.optimizer_name=='RMSProp':
+                self.optimizer = tf.train.RMSPropOptimizer(
+                self.model.learning_rate,
+                self.model.decay,
+                self.model.momentum,
+                self.model.epsilon)
+
+            grads_vars = self.optimizer.compute_gradients(
+                self.loss, self.train_vars)
+            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+            with tf.control_dependencies(update_ops):
+                self.train_step = self.optimizer.apply_gradients(
+                    grads_vars, global_step=self.global_step)
+
+    def initialize_optimizer(self):
+        
+        var_list = [var for var in tf.global_variables()
+                    if self.name in var.name]
+        self.sess.run(tf.variables_initializer(var_list))
+
+    def set_aux_model(self, prev_weights_path):
+
+        # creating the auxiliary model, if necessary
+        if not(hasattr(self, 'aux_model')):
+            self.aux_model = NN_extended.replicate_model(self.model, '_aux', True)
+            self.aux_model.add_assign_ops()
+        self.prev_weights_path = prev_weights_path
+
 
     def compute_init_conf_mats(self, train_dat_gen):
         """Computing initial confusion matrices for all the 
@@ -100,28 +187,7 @@ class model(object):
             E_posts[:,i] = joint / np.sum(joint)
 
         return E_posts
-                
-
-    def prepare_for_training(self, prev_weights_path):
-
-        # collecting all the train ops and the training feed_dict
-        feed_dict = {self.model.x: [], self.model.y_: []}
-        train_ops = [self.model.train_step]
-        for k in range(self.K):
-            for ell in range(self.c):
-                head_k_ell = self.model.branches['labeler_{}{}'.format(k,ell)]
-                feed_dict.update({head_k_ell.y_: [], 
-                                  head_k_ell.labeled_loss_weights: []})
-                train_ops += [head_k_ell.train_step]
-        self.feed_dict = feed_dict
-        self.train_ops = train_ops
-
-        # creating the auxiliary model, if necessary
-        if not(hasattr(self, 'aux_model')):
-            self.aux_model = NN_extended.replicate_model(self.model, '_aux', True)
-            self.aux_model.add_assign_ops()
-        self.prev_weights_path = prev_weights_path
-
+        
     def run_M_step(self,
                    dat_gen, 
                    M_iter):
@@ -148,17 +214,18 @@ class model(object):
             Xb, Zb, inds = next(dat_gen)
             posts_b = self.compute_Estep_posteriors(Xb, Zb, conf_mats)
     
-            self.feed_dict[self.model.x] = Xb
-            self.feed_dict[self.model.y_] = posts_b
+            feed_dict={}
+            feed_dict[self.model.x] = Xb
+            feed_dict[self.model.y_] = posts_b
             for k in range(self.K):
                 # observed annotations from the k-th labeler
                 for ell in range(self.c):
                     head_k_ell = self.model.branches['labeler_{}{}'.format(k,ell)]
             
-                    self.feed_dict[head_k_ell.y_] = Zb[k]
-                    self.feed_dict[head_k_ell.labeled_loss_weights] = posts_b[ell,:]
+                    feed_dict[head_k_ell.y_] = Zb[k]
+                    feed_dict[head_k_ell.labeled_loss_weights] = posts_b[ell,:]
                 
-            self.sess.run(self.train_ops, feed_dict=self.feed_dict)
+            self.sess.run(self.train_step, feed_dict=feed_dict)
 
     def iterate_EM(self, 
                    EM_iter,
@@ -190,7 +257,7 @@ class model(object):
             if test_dat_gen is not None:
                 eval_accs += [eval_model(self.model,self.sess,
                                          rep_test_gen[t-t0])[0]]
-                print(eval_accs)
+                print(eval_accs[-1], end=', ')
 
         return eval_accs
 
