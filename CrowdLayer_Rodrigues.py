@@ -42,10 +42,12 @@ class model(object):
 
                 self.CL_dict['CL_{}'.format(k)] = CL
 
-    def get_optimizer(self, optimizer_name='SGD', **opt_kwargs):
+    def get_optimizer(self, optimizer_name='SGD', 
+                      trace_reg=False,
+                      **opt_kwargs):
         """Setting up the loss and optimizer for the model
 
-        The loss of this model is the sum of individual losses
+        The loss of this model is the sum of individual CE losses
         in all the crowd layers.
         """
 
@@ -53,11 +55,18 @@ class model(object):
 
         with tf.variable_scope(self.model.name):
 
+            if trace_reg:
+                self.tr_reg_lambda = tf.placeholder(tf.float32)
+            else:
+                self.tr_reg_lambda = tf.constant(0.)
+
             # the loss
             for k in range(self.K):
                 self.CL_losses['CL_{}'.format(k)] = tf.losses.sparse_softmax_cross_entropy(
                     labels=self.CL_dict['CL_{}'.format(k)].labels, 
-                    logits=tf.transpose(self.CL_dict['CL_{}'.format(k)].output))
+                    logits=tf.transpose(self.CL_dict['CL_{}'.format(k)].output)) + \
+                    self.tr_reg_lambda * tf.trace(self.CL_dict['CL_{}'.format(k)].var_dict['last'][0])
+
             self.loss = tf.reduce_sum([loss for _,loss in self.CL_losses.items()])
 
             # the optimizer
