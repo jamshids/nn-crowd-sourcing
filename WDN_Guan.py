@@ -7,19 +7,22 @@ import os
 curr_path = os.getcwd()
 NN_model_path = os.path.join(os.path.dirname(curr_path), 'nn-active-learning')
 sys.path.insert(0, NN_model_path)
-
 import NN_extended
-from utils import compute_confusion_matrices, compute_posteriors_Estep
 
 class model(object):
 
-    def __init__(self, BN_model, sess, K,
-                 DN_lr=None):
+    def __init__(self, BN_model, 
+                 sess, K,
+                 DN_lr=None,
+                 name=None):
 
         self.K = K
         self.c = BN_model.class_num
         self.BN = BN_model
         self.sess = sess
+        self.name = name
+        if name is None:
+            self.name = BN_model+'_WDN'
 
         # get the same learning rate, if no other is available
         if DN_lr is None:
@@ -28,14 +31,24 @@ class model(object):
         # construct the DN models
         self.DN_dict = {}
         for k in range(K):
-            layers_dict = {'DN_{}'.format(k): ['fc', [self.c], 'M']}
+            layers_dict = {'last': ['fc', [self.c], 'M']}
             self.DN_dict['DN_{}'.format(k)] = NN_extended.CNN(
-                BN_model.output, layers_dict, 'DN_{}'.format(k),
+                BN_model.output, layers_dict, '{}/DN_{}'.format(self.name,k),
                 lr_schedule=DN_lr, loss_name='CE_softclasses')
             self.DN_dict['DN_{}'.format(k)].get_optimizer()
-            
+
         self.DN_train_ops = [self.DN_dict['DN_{}'.format(k)].train_step
                              for k in range(K)]
+
+    def initialize(self):
+        """Initializing all the models in the class
+        """
+        self.BN.initialize(self.sess)
+        for _, DN in self.DN_dict.items():
+            DN.initialize(self.sess)
+        self.sess.run(tf.variables_initializer([self.av_logits,
+                                                self.av_logits_global_step]))
+
 
     def train_DNs(self, train_dat_gen, max_iter):
 
@@ -56,48 +69,49 @@ class model(object):
         training the averaging logits
         """
 
-        self.av_logits = tf.get_variable('av_logits',
-                                         initializer=tf.constant(
-                                             0., shape=[self.K]))
-        posts_stack = tf.stack([self.DN_dict['DN_{}'.format(k)].posteriors
-                                for k in range(self.K)], axis=-1)
-        # the following is a matrix-vector element-wise multiplication
-        # when the vector is repeated along the rows to have the
-        # save size of te matrix (repetition is not done explicitly
-        # here, but through the broadcasting feature of multiplication)
-        self.weighted_av_pred = tf.reduce_sum(
-            posts_stack * tf.nn.softmax(self.av_logits), axis=-1)
+        with tf.variable_scope(self.name):
+            self.av_logits = tf.get_variable('av_logits',
+                                             initializer=tf.constant(
+                                                 0., shape=[self.K]))
+            posts_stack = tf.stack([self.DN_dict['DN_{}'.format(k)].posteriors
+                                    for k in range(self.K)], axis=-1)
+            # the following is a matrix-vector element-wise multiplication
+            # when the vector is repeated along the rows to have the
+            # save size of te matrix (repetition is not done explicitly
+            # here, but through the broadcasting feature of multiplication)
+            self.weighted_av_pred = tf.reduce_sum(
+                posts_stack * tf.nn.softmax(self.av_logits), axis=-1)
 
-        clipped_preds = tf.clip_by_value(self.weighted_av_pred, eps, 1-eps)
+            clipped_preds = tf.clip_by_value(self.weighted_av_pred, eps, 1-eps)
 
-        # plceholder for the target distribution
-        self.target_hist = tf.placeholder(tf.float32,  self.weighted_av_pred.shape)
+            # plceholder for the target distribution
+            self.target_hist = tf.placeholder(tf.float32,  self.weighted_av_pred.shape)
 
-        # define the loss function manually
-        self.av_logits_loss = -tf.reduce_mean(
-            tf.reduce_sum(
-                self.target_hist * tf.log(clipped_preds), axis=0))
+            # define the loss function manually
+            self.av_logits_loss = -tf.reduce_mean(
+                tf.reduce_sum(
+                    self.target_hist * tf.log(clipped_preds), axis=0))
 
-        # the optimizer
-        if lr_schedule is None:
-            lr_schedule = self.DN_dict['DN_0'].learning_rate
+            # the optimizer
+            if lr_schedule is None:
+                lr_schedule = self.DN_dict['DN_0'].learning_rate
 
-        if optimizer_name=='SGD':
-            self.av_logits_optimizer = tf.train.GradientDescentOptimizer(
-                lr_schedule, name='av_logits_SGD')
-        elif optimizer_name=='Adam':
-            self.av_logits_optimizer = tf.train_AdamOptimizer(
-                lr_schedule, name='av_logits_Adam')
+            if optimizer_name=='SGD':
+                self.av_logits_optimizer = tf.train.GradientDescentOptimizer(
+                    lr_schedule, name='av_logits_SGD')
+            elif optimizer_name=='Adam':
+                self.av_logits_optimizer = tf.train_AdamOptimizer(
+                    lr_schedule, name='av_logits_Adam')
 
-        # getting the training step
-        grad_var = self.av_logits_optimizer.compute_gradients(
-            self.av_logits_loss, self.av_logits)
-        self.av_logits_global_step = tf.Variable(0, trainable=False,
-                                                 name='av_logits_global_step')
-        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-        with tf.control_dependencies(update_ops):
-            self.av_logits_train_step = self.av_logits_optimizer.apply_gradients(
-                grad_var, global_step=self.av_logits_global_step)
+            # getting the training step
+            grad_var = self.av_logits_optimizer.compute_gradients(
+                self.av_logits_loss, self.av_logits)
+            self.av_logits_global_step = tf.Variable(0, trainable=False,
+                                                     name='av_logits_global_step')
+            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+            with tf.control_dependencies(update_ops):
+                self.av_logits_train_step = self.av_logits_optimizer.apply_gradients(
+                    grad_var, global_step=self.av_logits_global_step)
             
 
     def train_av_logits(self, train_gen, max_iter):
