@@ -48,8 +48,9 @@ class model(object):
             if PN_start_layer not in layers_w_pars[:i+1]:
                 continue
 
-            self.train_vars += [V for V in self.model.var_dict[layer] if V in
-                                tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)]
+
+            if hasattr(self.model, 'grads_vars'):
+                self.train_vars = [GV[1] for GV in self.model.grads_vars]
 
         # collect all the head losses and sum them up
         # also collect parameters of all the heads
@@ -60,9 +61,7 @@ class model(object):
                 # each head loss is equal to the weighted cross-entropy of
                 # the second term in ther M-step's objective
                 self.loss += [head_k_ell.loss]
-                for _,Vars in head_k_ell.var_dict.items():
-                    self.train_vars += [V for V in Vars if V in
-                                        tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)]
+                self.train_vars += [GV[1] for GV in head_k_ell.grads_vars]
         self.loss = tf.reduce_sum(self.loss)
 
         # now construct the train step and optimizer using parameters 
@@ -120,11 +119,16 @@ class model(object):
         # get the prediction of the current model
         Z = [[] for i in range(self.K)]
         train_preds = []
+        if len(self.model.dropout_layers)>0:
+            feed_dict = {self.model.keep_prob: 1.}
+        else:
+            feed_dict = {}
         for Xb, Zb, _ in train_dat_gen:
             for i in range(self.K):
                 Z[i] += [Zb[i]]
+            feed_dict[self.model.x] = Xb
             train_preds += [self.sess.run(self.model.prediction, 
-                                    feed_dict={self.model.x: Xb})]
+                                          feed_dict=feed_dict)]
         for i in range(self.K):
             Z[i] = np.concatenate(Z[i], axis=1)
         train_preds = np.concatenate(train_preds)
@@ -149,11 +153,17 @@ class model(object):
         """
 
         conf_mats = np.zeros((self.c, self.c, self.K))
+        feed_dict = {}
+        if len(self.model.dropout_layers)>0:
+            feed_dict[self.model.keep_prob] = 1.
         for k in range(self.K):
             for ell in range(self.c):
-                head_k_ell = self.aux_model.branches['labeler_{}{}'.format(k,ell)]
+                head_k_ell = self.model.branches['labeler_{}{}'.format(k,ell)]
+                if len(head_k_ell.dropout_layers)>0:
+                    feed_dict[head_k_ell.keep_prob] = 1.
+                feed_dict[self.model.x] = single_x
                 pi_jell_k = self.sess.run(head_k_ell.posteriors, 
-                                          feed_dict={head_k_ell.x: single_x})
+                                          feed_dict=feed_dict)
                 conf_mats[:,ell,k] = np.squeeze(pi_jell_k)
 
         return conf_mats
@@ -161,8 +171,9 @@ class model(object):
     def compute_Estep_posteriors(self, Xb, Zb, conf_mats=None):
         
         # priors
-        pies = self.sess.run(self.aux_model.posteriors, 
-                             feed_dict={self.model.x:Xb})
+        pies = self.sess.run(self.model.posteriors, 
+                             feed_dict={self.model.x:Xb,
+                                        self.model.keep_prob:1.})
         E_posts = np.zeros((self.c, pies.shape[1]))
         for i in range(pies.shape[1]):
 
@@ -217,6 +228,8 @@ class model(object):
             feed_dict={}
             feed_dict[self.model.x] = Xb
             feed_dict[self.model.y_] = posts_b
+            if len(self.model.dropout_layers)>0:
+                feed_dict[self.model.keep_prob] = 1-self.model.dropout_rate
             for k in range(self.K):
                 # observed annotations from the k-th labeler
                 for ell in range(self.c):
@@ -224,6 +237,8 @@ class model(object):
             
                     feed_dict[head_k_ell.y_] = Zb[k]
                     feed_dict[head_k_ell.labeled_loss_weights] = posts_b[ell,:]
+                    if len(head_k_ell.dropout_layers)>0:
+                        feed_dict[head_k_ell.keep_prob] = 1-head_k_ell.dropout_rate
                 
             self.sess.run(self.train_step, feed_dict=feed_dict)
 
@@ -244,8 +259,8 @@ class model(object):
             # model so that it can be used to compute the E-step
             # posteriors of the selected mini-batch samples in
             # the M-step objective.
-            self.aux_model.perform_assign_ops(
-                self.prev_weights_path, self.sess)
+            #self.aux_model.perform_assign_ops(
+            #    self.prev_weights_path, self.sess)
 
             # M-step
             self.run_M_step(dat_gen, M_iter)
@@ -257,7 +272,7 @@ class model(object):
             if test_dat_gen is not None:
                 eval_accs += [eval_model(self.model,self.sess,
                                          rep_test_gen[t-t0])[0]]
-                print(eval_accs[-1], end=', ')
+                print({'0:.4f'}.format(eval_accs[-1]), end=', ')
 
         return eval_accs
 
@@ -266,8 +281,15 @@ def eval_model(model,sess,dat_gen):
 
     preds = []
     grounds = []
+    if model.dropout_rate is None:
+        feed_dict = {}
+    else:
+        feed_dict = {model.keep_prob: 1.}
+    
     for Xb, Yb,_ in dat_gen:
-        preds += [sess.run(model.prediction, feed_dict={model.x:Xb})]
+        feed_dict.update({model.x:Xb})
+        preds += [sess.run(model.prediction, 
+                           feed_dict=feed_dict)]
         grounds += [np.argmax(Yb, axis=0)]
     preds = np.concatenate(preds)
     grounds = np.concatenate(grounds)
