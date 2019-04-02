@@ -22,78 +22,9 @@ class model(object):
         if name is None:
             self.name = model.name + '_ConfLayer'
 
-
-    def get_optimizer(self, PN_start_layer=None):
-
-
-        # start by collecting parameters of the prior-net
-        # based on the layer from which multiple annotator branches
-        # are extracted from
-        if PN_start_layer is None:
-            # assuming that there is only one probe at the
-            # input of the prior-net
-            probed_inputs = self.model.probes[0]
-            assert len(probed_inputs)==1, 'There is ambiguity in'+\
-                ' detecting the first layer of PN.'
-            PN_start_layer = list(probed_inputs.keys())[0]
-        
-        # take all the layers after the starting layer as the 
-        # PN ---  for now assume we want to add ALL these layers
-        # into the training part
-        self.train_vars = []
-        layers_w_pars = list(self.model.var_dict.keys())
-        for i, layer in enumerate(self.model.layer_dict):
-            # we still have not reached the beginning of PN,
-            # just continue
-            if PN_start_layer not in layers_w_pars[:i+1]:
-                continue
-
-
-            if hasattr(self.model, 'grads_vars'):
-                self.train_vars = [GV[1] for GV in self.model.grads_vars]
-
-        # collect all the head losses and sum them up
-        # also collect parameters of all the heads
-        self.loss = [self.model.loss]
-        for k in range(self.K):
-            for ell in range(self.c):
-                head_k_ell = self.model.branches['labeler_{}{}'.format(k,ell)]
-                # each head loss is equal to the weighted cross-entropy of
-                # the second term in ther M-step's objective
-                self.loss += [head_k_ell.loss]
-                self.train_vars += [GV[1] for GV in head_k_ell.grads_vars]
-        self.loss = tf.reduce_sum(self.loss)
-
-        # now construct the train step and optimizer using parameters 
-        # set in the main body model
-        with tf.variable_scope(self.name):
-            self.global_step = tf.Variable(0, trainable=False, 
-                                           name='global_step')
-
-            if self.model.optimizer_name=='SGD':
-                self.optimizer = tf.train.GradientDescentOptimizer(
-                    self.model.learning_rate)
-            elif self.model.optimizer_name=='Adam':
-                self.optimizer = tf.train.AdamOptimizer(
-                    self.model.learning_rate, 
-                    self.model.beta1, 
-                    self.model.beta2)
-            elif self.model.optimizer_name=='RMSProp':
-                self.optimizer = tf.train.RMSPropOptimizer(
-                self.model.learning_rate,
-                self.model.decay,
-                self.model.momentum,
-                self.model.epsilon)
-
-            grads_vars = self.optimizer.compute_gradients(
-                self.loss, self.train_vars)
-            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-            with tf.control_dependencies(update_ops):
-                self.train_step = self.optimizer.apply_gradients(
-                    grads_vars, global_step=self.global_step)
-
     def initialize_optimizer(self):
         
+        # this var_list does not contain the mode variables
         var_list = [var for var in tf.global_variables()
                     if self.name in var.name]
         self.sess.run(tf.variables_initializer(var_list))
@@ -107,31 +38,27 @@ class model(object):
         self.prev_weights_path = prev_weights_path
 
 
-    def compute_init_conf_mats(self, train_dat_gen):
+    def compute_init_conf_mats(self, non_eternal_dat_gens):
         """Computing initial confusion matrices for all the 
-        labelers
-
-        The data is provided through a data generator `train_dat_gen`
-        which generates the training data. The eternality flag is set to 
-        `False`, hence the generator stops once all the samples are visited.
+        labelers, using the prediction of the current PN model
         """
 
         # get the prediction of the current model
         Z = [[] for i in range(self.K)]
-        train_preds = []
-        if len(self.model.dropout_layers)>0:
-            feed_dict = {self.model.keep_prob: 1.}
-        else:
-            feed_dict = {}
-        for Xb, Zb, _ in train_dat_gen:
-            for i in range(self.K):
-                Z[i] += [Zb[i]]
-            feed_dict[self.model.x] = Xb
-            train_preds += [self.sess.run(self.model.prediction, 
-                                          feed_dict=feed_dict)]
-        for i in range(self.K):
-            Z[i] = np.concatenate(Z[i], axis=1)
-        train_preds = np.concatenate(train_preds)
+        train_preds = [[] for i in range(self.K)]
+
+        for k, dat_gen in enumerate(non_eternal_dat_gens):
+            for Xb, Zb, _ in dat_gen:
+                # here, for samples coming from A_k, only labels
+                # of the k-th labeler will be necessary
+                Z[k] += [Zb[k]]
+
+                feed_dict = {self.model.x:Xb, self.model.keep_prob:1.}
+                train_preds[k] += [self.sess.run(self.model.prediction, 
+                                                 feed_dict=feed_dict)]
+        for k in range(self.K):
+            Z[k] = np.concatenate(Z[k], axis=1)
+            train_preds[k] = np.concatenate(train_preds[k])
 
         # Z and preds are shuffled here (the order is randomly
         # determined based on random generation of the batches),
@@ -143,8 +70,8 @@ class model(object):
         for k in range(self.K):
             for j in range(self.c):
                 for ell in range(self.c):
-                    restricted_Z = Z[k][:, train_preds==ell]
-                    init_conf_mats[j,ell,k] = np.sum(restricted_Z[j,:]) / np.sum(train_preds==ell)
+                    restricted_Z = Z[k][:, train_preds[k]==ell]
+                    init_conf_mats[j,ell,k] = np.sum(restricted_Z[j,:]) / np.sum(train_preds[k]==ell)
 
         return init_conf_mats
 
@@ -200,15 +127,19 @@ class model(object):
         return E_posts
         
     def run_M_step(self,
-                   dat_gen, 
+                   eternal_gens, 
                    M_iter):
-        """ Performing one step of the M-step
+        """ Performing the M-step for few iterations
 
-        The input data generator `dat_gen` is assumed to output three
-        values: `(Xb, Yb, inds)`, where
+        The input `eternal_gens` is a list of generators with length K+1.
+        The first K generators only generate samples from A_k (to be used
+        in fine-tuning heads associated with the k-th labeler), whereas the
+        last generator generate samples generally from [n]. Each generator
+        outputs the following in each call:
         
             * `Xb`: batch of samples
             * `Zb`: observed labels for the samples (list of `K` label matrices)  
+            *  the third element is not important (will be deprecated soon)
 
         The eternality flag of this data generator should be set to `True` so
         that it does not stop iterations even when all the samples are visited.
@@ -222,34 +153,56 @@ class model(object):
             conf_mats = None  # should be comptued for each sample
 
         for _ in range(M_iter):
-            Xb, Zb, inds = next(dat_gen)
-            posts_b = self.compute_Estep_posteriors(Xb, Zb, conf_mats)
-    
-            feed_dict={}
-            feed_dict[self.model.x] = Xb
-            feed_dict[self.model.y_] = posts_b
-            if len(self.model.dropout_layers)>0:
-                feed_dict[self.model.keep_prob] = 1-self.model.dropout_rate
-            for k in range(self.K):
-                # observed annotations from the k-th labeler
+
+            """ fine-tuning heads of the k-th labeler """
+            """ ------------------------------------- """
+            for k, dat_gen in enumerate(eternal_gens[:-1]):
+                Xb, Zb, _ = next(dat_gen)
+                posts_b = self.compute_Estep_posteriors(Xb, Zb, conf_mats)
+
+                # train-step ops of heads (k,0),...,(k,c)
+                train_steps = []
+                feed_dict = {self.model.x: Xb,
+                             self.model.keep_prob: 1.}
                 for ell in range(self.c):
                     head_k_ell = self.model.branches['labeler_{}{}'.format(k,ell)]
-            
+
+                    # filling the corresponding feed_dict
                     feed_dict[head_k_ell.y_] = Zb[k]
                     feed_dict[head_k_ell.labeled_loss_weights] = posts_b[ell,:]
-                    if len(head_k_ell.dropout_layers)>0:
-                        feed_dict[head_k_ell.keep_prob] = 1-head_k_ell.dropout_rate
-                
-            self.sess.run(self.train_step, feed_dict=feed_dict)
+                    feed_dict[head_k_ell.keep_prob] = 1-head_k_ell.dropout_rate
+                    
+                    # adding the train step
+                    train_steps += [head_k_ell.train_step]
+                    
+                self.sess.run(train_steps, feed_dict=feed_dict)
+
+            """ fine-tuning the prior-net """
+            """ ------------------------- """
+            Xb,Zb,_ = next(eternal_gens[-1])
+            posts_b = self.compute_Estep_posteriors(Xb, Zb, conf_mats)
+    
+            feed_dict = {self.model.x: Xb, 
+                         self.model.y_: posts_b,
+                         self.model.keep_prob: 1-self.model.dropout_rate}
+            self.sess.run(self.model.train_step, feed_dict=feed_dict)
 
     def iterate_EM(self, 
                    EM_iter,
                    M_iter,
-                   dat_gen,
-                   test_dat_gen=None):
+                   eternal_gens,
+                   test_non_eternal_gen=None):
+        """This function takes a list of eternal generators (one
+        per annotator) and one non-eternal generator for test data.
 
-        if test_dat_gen is not None:
-            rep_test_gen = tee(test_dat_gen, EM_iter)
+        Having multiple eternal generators allows the algorithm
+        to run for missing data as well, because the generators will
+        be built such that they generate only those samples that are
+        labeled by each annotator.
+        """
+
+        if test_non_eternal_gen is not None:
+            rep_test_gen = tee(test_non_eternal_gen, EM_iter)
         eval_accs = []
         t0 = self.t
         for t in range(self.t, self.t+EM_iter):
@@ -263,7 +216,7 @@ class model(object):
             #    self.prev_weights_path, self.sess)
 
             # M-step
-            self.run_M_step(dat_gen, M_iter)
+            self.run_M_step(eternal_gens, M_iter)
             self.t += 1
 
             # saving the weights
@@ -275,25 +228,3 @@ class model(object):
                 print({'0:.4f'}.format(eval_accs[-1]), end=', ')
 
         return eval_accs
-
-
-def eval_model(model,sess,dat_gen):
-
-    preds = []
-    grounds = []
-    if model.dropout_rate is None:
-        feed_dict = {}
-    else:
-        feed_dict = {model.keep_prob: 1.}
-    
-    for Xb, Yb,_ in dat_gen:
-        feed_dict.update({model.x:Xb})
-        preds += [sess.run(model.prediction, 
-                           feed_dict=feed_dict)]
-        grounds += [np.argmax(Yb, axis=0)]
-    preds = np.concatenate(preds)
-    grounds = np.concatenate(grounds)
-    acc = np.sum(preds==grounds) / len(preds)
-
-    return acc, preds
-            
