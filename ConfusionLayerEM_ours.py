@@ -7,7 +7,9 @@ import os
 curr_path = os.getcwd()
 NN_model_path = os.path.join(os.path.dirname(curr_path), 'nn-active-learning')
 sys.path.insert(0, NN_model_path)
+
 import NN_extended
+from eval_utils import simple_eval_model
 
 class model(object):
 
@@ -222,9 +224,9 @@ class model(object):
             # saving the weights
             self.model.save_weights(self.prev_weights_path)
 
-            if test_dat_gen is not None:
-                eval_accs += [eval_model(self.model,self.sess,
-                                         rep_test_gen[t-t0])[0]]
-                print({'0:.4f'}.format(eval_accs[-1]), end=', ')
+            if test_non_eternal_gen is not None:
+                eval_accs += [simple_eval_model(self.model,self.sess,
+                                                rep_test_gen[t-t0])[0]]
+                print('{0:.4f}'.format(eval_accs[-1]), end=', ')
 
         return eval_accs
