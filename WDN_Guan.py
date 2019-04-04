@@ -13,8 +13,9 @@ class model(object):
 
     def __init__(self, BN_model, 
                  sess, K,
-                 DN_lr=None,
-                 name=None):
+                 name,
+                 input_to_DN=None,
+                 **kwargs):
 
         self.K = K
         self.c = BN_model.class_num
@@ -22,44 +23,67 @@ class model(object):
         self.sess = sess
         self.name = name
         if name is None:
-            self.name = BN_model+'_WDN'
+            self.name = BN_model+'_WDN'    
+        
+        # take the last hidden layer of BN_model
+        # if no alternative input to DN is provided
+        if input_to_DN is None:
+            if len(BN_model.var_dict)==0:
+                input_to_DN = BN_model.output
 
-        # get the same learning rate, if no other is available
-        if DN_lr is None:
-            DN_lr = BN_model.learning_rate
+            else:
+                probed_inputs = list(BN_model.probes[0].keys())
 
+                assert len(probed_inputs)>0, \
+                    'BN should be probed in the input of the'+\
+                    ' last hidden layer.'
+                assert len(probed_inputs)==1, \
+                    'There is ambiguity in which input-probe '+\
+                    'is the input to the last layer'
+
+                input_to_DN = BN_model.probes[0][probed_inputs[0]]
+            
         # construct the DN models
         self.DN_dict = {}
         for k in range(K):
             layers_dict = {'last': ['fc', [self.c], 'M']}
             self.DN_dict['DN_{}'.format(k)] = NN_extended.CNN(
-                BN_model.output, layers_dict, '{}/DN_{}'.format(self.name,k),
-                lr_schedule=DN_lr, loss_name='CE_softclasses')
+                input_to_DN, 
+                layers_dict, '{}/DN_{}'.format(self.name,k),
+                **kwargs)
             self.DN_dict['DN_{}'.format(k)].get_optimizer()
 
         self.DN_train_ops = [self.DN_dict['DN_{}'.format(k)].train_step
                              for k in range(K)]
 
-    def initialize(self):
+    def initialize(self, BN_too=False):
         """Initializing all the models in the class
         """
-        self.BN.initialize(self.sess)
+        
+        if BN_too:
+            self.BN.initialize(self.sess)
+
         for _, DN in self.DN_dict.items():
             DN.initialize(self.sess)
         self.sess.run(tf.variables_initializer([self.av_logits,
                                                 self.av_logits_global_step]))
 
 
-    def train_DNs(self, train_dat_gen, max_iter):
+    def train_DNs(self, eternal_gens, max_iter):
+        """Training DNs using eternal generators per annotator
+        """
 
         for _ in range(max_iter):
-            Xb,Zb,_ = next(train_dat_gen)
-            feed_dict = {self.BN.x: Xb}
-            for k in range(self.K):
-                feed_dict.update({
-                    self.DN_dict['DN_{}'.format(k)].y_: Zb[k]})
+            for k, gen in enumerate(eternal_gens):
+                Xb,Zb,_ = next(gen)
+                feed_dict = {
+                    self.BN.x: Xb,
+                    self.BN.keep_prob: 1.,
+                    self.DN_dict['DN_{}'.format(k)].y_: Zb[k],
+                    self.DN_dict['DN_{}'.format(k)].keep_prob: 
+                    1. - self.DN_dict['DN_{}'.format(k)].dropout_rate}
 
-            self.sess.run(self.DN_train_ops, feed_dict=feed_dict)
+                self.sess.run(self.DN_train_ops[k], feed_dict=feed_dict)
 
     def get_optimizer_av_logits(self, 
                                 eps=1e-6, 
@@ -114,42 +138,77 @@ class model(object):
                     grad_var, global_step=self.av_logits_global_step)
             
 
-    def train_av_logits(self, train_gen, max_iter):
+    def train_av_logits(self, eternal_gen, max_iter):
         """Performing iterations of training the averaging logits
         """
         
+        feed_dict = {MODEL[1].keep_prob: 1. for MODEL in self.DN_dict.items()}
+        feed_dict[self.BN.keep_prob] = 1.
+
         for _ in range(max_iter):
-            Xb, Zb, _ = next(train_gen)
+            Xb, Zb, _ = next(eternal_gen)
             # get the target histogram from labelers' labels
             # Although Zb is a list, not an array, the following
             # adds all the arrays in this list elementwise
             target_hist_val = np.sum(Zb, axis=0)
             target_hist_val = target_hist_val / np.sum(target_hist_val, axis=0)
 
-            self.sess.run(self.av_logits_train_step, 
-                          feed_dict={self.BN.x:Xb,
-                                     self.target_hist: target_hist_val})
-        
 
-def eval_average_of_models(models, sess, dat_gen, weights=None):
+            feed_dict[self.BN.x] = Xb
+            feed_dict[self.target_hist] = target_hist_val
+            self.sess.run(self.av_logits_train_step, feed_dict=feed_dict)
+
+
+def eval_DN(wdn_model, non_eternal_gen, DN_idx):
+    """Evaluating DN (Doctor-Net) in a `WDN_Guan`
+    class object
+
+    Index of the DN (`DN_idx`) should be given in string format.
+    """
+
+    preds = []
+    grounds = []
+    
+    DN_model = wdn_model.DN_dict['DN_{}'.format(DN_idx)]
+
+    for Xb, Yb,_ in non_eternal_gen:
+        feed_dict={wdn_model.BN.x:Xb,
+                   wdn_model.BN.keep_prob: 1.,
+                   DN_model.keep_prob: 1.}
+        preds += [wdn_model.sess.run(DN_model.prediction, feed_dict=feed_dict)]
+
+        if isinstance(Yb, list):
+            Yb = Yb[int(DN_idx)]
+        grounds += [np.argmax(Yb, axis=0)]
+    preds = np.concatenate(preds)
+    grounds = np.concatenate(grounds)
+    acc = np.sum(preds==grounds) / len(preds)
+    return acc, preds
+
+
+def eval_average_DN(wdn_model, non_eternal_gen, weights=None):
     """Evaluating predictions obtianed by (weighted)
     averaging of an ensemble of models
 
     We assume the input weights sum to one (hence a PMF).
     """
 
+    K = wdn_model.K
     if weights is None:
-        weights = np.ones(len(models)) / len(models)
+        weights = np.ones(K) / K
 
     preds = []
     grounds = []
-    for Xb, Yb, _ in dat_gen:
+    feed_dict = {MODEL[1].keep_prob:1. for MODEL in wdn_model.DN_dict.items()}
+    feed_dict[wdn_model.BN.keep_prob] = 1.
+    for Xb, Yb, _ in non_eternal_gen:
+        feed_dict[wdn_model.BN.x] = Xb
+
         # average posterior
-        posts = weights[0] * sess.run(models[0].posteriors, 
-                                      feed_dict={models[0].x:Xb})
-        for i, model in enumerate(models[1:]):
-            posts += weights[i+1] * sess.run(model.posteriors, 
-                                             feed_dict={model.x:Xb})
+        posts = 0
+        for k, M in enumerate(wdn_model.DN_dict.items()):
+            posts += weights[k] * wdn_model.sess.run(M[1].posteriors, 
+                                                     feed_dict=feed_dict)
         preds += [np.argmax(posts, axis=0)]
         grounds += [np.argmax(Yb, axis=0)]
 
@@ -160,12 +219,17 @@ def eval_average_of_models(models, sess, dat_gen, weights=None):
     return acc, preds
 
 
-def eval_WDN_model(WDN_model, dat_gen):
+def eval_WDN_model(wdn_model, dat_gen):
+
+    feed_dict = {MODEL[1].keep_prob:1. for MODEL in wdn_model.DN_dict.items()}
+    feed_dict[wdn_model.BN.keep_prob] = 1.
+
     preds = []
     grnds = []
     for Xb,Yb,_ in dat_gen:
-        av_posts = WDN_model.sess.run(WDN_model.weighted_av_pred, 
-                                      feed_dict={WDN_model.BN.x:Xb})
+        feed_dict[wdn_model.BN.x] = Xb
+        av_posts = wdn_model.sess.run(wdn_model.weighted_av_pred, 
+                                      feed_dict=feed_dict)
         preds += [np.argmax(av_posts, axis=0)]
         grnds += [np.argmax(Yb, axis=0)]
 
