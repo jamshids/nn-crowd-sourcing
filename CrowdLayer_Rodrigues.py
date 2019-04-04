@@ -31,7 +31,7 @@ class model(object):
                                                    CL.regularizer,
                                                    CL.custom_getter)
                 CL.output = tf.matmul(W_CL, CL.output)
-                if CL.dropout_rate is not None:
+                if len(CL.dropout_layers) > 0:
                     CL.output = tf.nn.dropout(CL.output, CL.keep_prob)
                     
                 # update the prediction and posterior ops
@@ -61,13 +61,22 @@ class model(object):
                 self.tr_reg_lambda = tf.constant(0.)
 
             # the loss
+            self.masked_y = []
+            self.masked_output = []
             for k in range(self.K):
-                self.CL_losses['CL_{}'.format(k)] = tf.losses.sparse_softmax_cross_entropy(
-                    labels=self.CL_dict['CL_{}'.format(k)].labels, 
-                    logits=tf.transpose(self.CL_dict['CL_{}'.format(k)].output)) + \
-                    self.tr_reg_lambda * tf.trace(self.CL_dict['CL_{}'.format(k)].var_dict['last'][0])
+                CL = self.CL_dict['CL_{}'.format(k)]
 
-            self.loss = tf.reduce_sum([loss for _,loss in self.CL_losses.items()])
+                # filter one-hot label placeholder
+                y_mask = tf.not_equal(tf.reduce_sum(CL.y_, axis=0),0)
+                self.masked_y += [tf.boolean_mask(CL.y_, y_mask, axis=1)]
+                self.masked_output += [tf.boolean_mask(CL.output, y_mask, axis=1)]
+
+                self.CL_losses['CL_{}'.format(k)] = tf.nn.softmax_cross_entropy_with_logits_v2(
+                    labels=tf.transpose(self.masked_y[k]), 
+                    logits=tf.transpose(self.masked_output[k])) + \
+                    self.tr_reg_lambda * tf.trace(CL.var_dict['last'][0])
+
+            self.loss = tf.reduce_sum([tf.reduce_mean(loss) for _,loss in self.CL_losses.items()])
 
             # the optimizer
             if optimizer_name=='SGD':
