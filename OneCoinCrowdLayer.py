@@ -16,9 +16,9 @@ from eval_utils import simple_eval_model
 class model(object):
 
 
-    def __init__(self, model, sess, name=None):
+    def __init__(self, model, sess, K, name=None):
 
-        self.K = len(model.branches)
+        self.K = K
         self.c = model.class_num
         self.t = 0      # EM iteration index
         self.model = model
@@ -27,41 +27,70 @@ class model(object):
         if name is None:
             self.name = model.name + '_OneCoinLayer'
 
-    def get_optimizers_for_heads(self, eps=1e-3, optimizer_name='SGD'):
+    def build_crowd_layers(self):
 
-        self.eps = eps
-        self.heads_clipped_posts = []
-        for k in range(self.K):
+        # dimensionality of the input to the crowd layers
+        probed_inputs = list(self.model.probes[0].keys())
+        assert len(probed_inputs)==1, \
+            'There is ambiguity in which input probes is '+\
+            'the input to the crowd layers.'
+        U = self.model.probes[0][probed_inputs[0]]
+        du = U.shape[0].value
 
-            # loss
-            # -----------------
-            head_k = self.model.branches['labeler_{}'.format(k)]
-            self.heads_clipped_posts += [tf.clip_by_value(head_k.posteriors,eps,1-eps)]
-            head_k.loss = -tf.reduce_mean(tf.reduce_sum(
-                head_k.y_ * tf.log(self.heads_clipped_posts[k]), axis=0))
+        shape_W = [self.K, 2, du]
+        shape_b = [self.K, 2, 1]
+        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
+            # parameters of the crowd layers
+            init_W = tf.constant(0., shape=shape_W)
+            self.crowd_W = tf.get_variable('crowd_W', initializer=init_W)
+            init_b = tf.constant(0., shape=shape_b)
+            self.crowd_b = tf.get_variable('crowd_b', initializer=init_b)
 
-            # optimizer
-            # -----------------
+            # output of the crowd layers 
+            # (K x c x b)
+            self.crowd_output = tf.keras.backend.dot(self.crowd_W,U) + self.crowd_b
+            self.crowd_posteriors = tf.nn.softmax(self.crowd_output,
+                                                  axis=1)
+            
+            # get the target placeholder for the crowds
+            self.crowd_target = tf.placeholder(tf.float32, 
+                                               self.crowd_output.shape)
+
+
+    def get_crowd_optimizer(self, optimizer_name='SGD'):
+        
+        eps = 1e-6
+        clipped_crowd_posteriors = tf.clip_by_value(
+            self.crowd_posteriors,eps,1-eps)
+
+        self.loss = -tf.reduce_mean(tf.reduce_sum(
+            self.crowd_target * tf.log(clipped_crowd_posteriors), axis=0))
+
+        # filtering missing data
+        #mask = tf.equal(self.crowd_target[:,0,:], -2)
+        #zer = tf.zeros-like(full_loss)
+        #self.loss = tf.where(mask,  x=zer, y=full_loss)
+
+        # optimizer
+        # -----------------
+        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
+            self.crowd_global_step = tf.Variable(
+                0, trainable=False, name='crowd_global_step')
+
             if optimizer_name=='SGD':
-                head_k.optimizer = tf.train.GradientDescentOptimizer(
-                    head_k.learning_rate, name='av_logits_SGD')
+                self.crowd_optimizer = tf.train.GradientDescentOptimizer(
+                    self.model.learning_rate)
             elif optimizer_name=='Adam':
-                head_k.optimizer = tf.train_AdamOptimizer(
-                    head_k.learning_rate, name='av_logits_Adam')
+                self.crowd_optimizer = tf.train_AdamOptimizer(
+                    self.model.learning_rate)
 
-            var_list = []
-            # ASSUMPTION: all the variables in the heads' layers are assumed
-            # to be in list of trainable variables (hence no BN in the heads)
-            for _,V in head_k.var_dict.items():
-                if 'labeler_{}'.format(k) in V[0].name:
-                    var_list += V
-            head_k.grads_vars = head_k.optimizer.compute_gradients(head_k.loss, var_list)
+            self.crowd_grads_vars = self.crowd_optimizer.compute_gradients(
+                self.loss, [self.crowd_W, self.crowd_b])
 
             update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
             with tf.control_dependencies(update_ops):
-                head_k.train_step = head_k.optimizer.apply_gradients(
-                    head_k.grads_vars, global_step=head_k.global_step)
-
+                self.crowd_train_step = self.crowd_optimizer.apply_gradients(
+                    self.crowd_grads_vars, global_step=self.crowd_global_step)
 
     def initialize_optimizer(self):
         
@@ -134,22 +163,16 @@ class model(object):
         size of input `Xb`:  d x b
         size of output    :  K x 2 x b
         """
-        
-        succ_probs = []
 
-        feed_dict = {self.model.branches['labeler_{}'.format(k)].keep_prob: 1.
-                     for k in range(self.K)}
-        feed_dict[self.model.x] = Xb 
-        feed_dict[self.model.keep_prob] = 1.
-        for k in range(self.K):
-            head_k = self.model.branches['labeler_{}'.format(k)]
-            succ_prob_k = self.sess.run(head_k.posteriors, feed_dict=feed_dict)
-            succ_probs += [np.expand_dims(succ_prob_k, axis=0)]
-
-        return np.concatenate(succ_probs, axis=0)
+        feed_dict = {self.model.x: Xb, self.model.keep_prob: 1.}
+        return self.sess.run(self.crowd_posteriors, feed_dict=feed_dict)
 
 
     def compute_Estep_posteriors(self, Xb, Zb, succ_probs=None):
+        """Computing E-step posteriors of the ground truth
+
+        Output size:   c x b
+        """
         
         # priors  (c x b)
         pies = self.sess.run(self.model.posteriors, 
@@ -165,20 +188,17 @@ class model(object):
 
         # joints (initialized by the priors)
         joints = pies*1
-        # Zb tensor (K x b)
-        Zb_tns = []
-        for k in range(self.K):
-            alabels = np.argmax(Zb[k], axis=0)
-            # no label for annotator k ==> make it -1
-            # (or anything different than 0,...,c-1)
-            alabels[np.max(Zb[k], axis=0)==0] = -1
-            Zb_tns += [np.expand_dims(alabels, axis=0)]
-        Zb_tns = np.concatenate(Zb_tns, axis=0)
+        # Labels tensor (K x b)
+        Zb_tns = np.stack(Zb, axis=0)
+        Lb_tns = np.argmax(Zb_tns, axis=1)
+        # no label for annotator k ==> make it -1
+        # (or anything different than 0,...,c-1)
+        Lb_tns[np.max(Zb_tns, axis=1)==0] = -1
 
         for ell in range(self.c):
             # z_i^k==ell  (K x b)
-            eq_indic = np.float32(Zb_tns == ell)
-            non_eq_indic = np.float32(Zb_tns != ell) * np.float32(Zb_tns>-1)
+            eq_indic = np.float32(Lb_tns == ell)
+            non_eq_indic = np.float32(Lb_tns != ell) * np.float32(Lb_tns>-1)
             joints[ell,:] = joints[ell,:] * \
                             np.prod(succ_probs[:,0,:]**eq_indic, axis=0) * \
                             np.prod(succ_probs[:,1,:]**non_eq_indic, axis=0)
@@ -187,7 +207,7 @@ class model(object):
         
 
     def run_M_step(self,
-                   eternal_gens, 
+                   eternal_gen, 
                    M_iter):
         """ Performing the M-step for few iterations
 
@@ -216,29 +236,26 @@ class model(object):
 
             """ fine-tuning the k-th labeler's head """
             """ ----------------------------------- """
-            for k, dat_gen in enumerate(eternal_gens[:-1]):
-                Xb, Zb, _ = next(dat_gen)
-                posts_b = self.compute_Estep_posteriors(Xb, Zb, succ_probs)
+            Xb, Zb, _ = next(eternal_gen)
+            posts_b = self.compute_Estep_posteriors(Xb, Zb, succ_probs)
+            rep_posts_b = np.repeat(np.expand_dims(posts_b,axis=0),
+                                    self.K, axis=0)
 
-                head_k = self.model.branches['labeler_{}'.format(k)]
+            # the target for the i-th sample:  -p^t(xi) * [1,-1]
+            target = np.zeros((self.K, 2, posts_b.shape[1]))
+            Zb_tns = np.stack(Zb, axis=0)
+            rep_posts_zeroed = rep_posts_b * Zb_tns
+            target[:,0,:] = np.max(rep_posts_zeroed, axis=1)
+            target[:,1,:] = -target[:,0,:]
+            
+            feed_dict = {self.model.x: Xb,
+                         self.model.keep_prob: 1.,
+                         self.crowd_target: target}
 
-                # the target for the i-th sample:  -p^t(xi) * [1,-1]
-                alabels = np.argmax(Zb[k], axis=0)
-                target = posts_b[alabels,np.arange(posts_b.shape[1])] 
-                target = np.outer(np.array([[1],[-1]]), target)
-
-                feed_dict = {self.model.x: Xb,
-                             self.model.keep_prob: 1.,
-                             head_k.y_: target,
-                             head_k.keep_prob: 1-head_k.dropout_rate}
-
-                self.sess.run(head_k.train_step, feed_dict=feed_dict)
+            self.sess.run(self.crowd_train_step, feed_dict=feed_dict)
 
             """ fine-tuning the prior-net """
             """ ------------------------- """
-            Xb,Zb,_ = next(eternal_gens[-1])
-            posts_b = self.compute_Estep_posteriors(Xb, Zb, succ_probs)
-    
             feed_dict = {self.model.x: Xb, 
                          self.model.y_: posts_b,
                          self.model.keep_prob: 1-self.model.dropout_rate}
