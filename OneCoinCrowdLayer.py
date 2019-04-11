@@ -41,13 +41,14 @@ class model(object):
         shape_b = [self.K, 2, 1]
         with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
             # parameters of the crowd layers
-            init_W = tf.constant(0., shape=shape_W)
+            init_W = np.zeros(shape_W, dtype=np.float32)
+            init_W[:,0,:] = 1.#tf.constant(0., shape=shape_W)
             self.crowd_W = tf.get_variable('crowd_W', initializer=init_W)
             init_b = tf.constant(0., shape=shape_b)
             self.crowd_b = tf.get_variable('crowd_b', initializer=init_b)
 
             # output of the crowd layers 
-            # (K x c x b)
+            # (K x 2 x b)
             self.crowd_output = tf.keras.backend.dot(self.crowd_W,U) + self.crowd_b
             self.crowd_posteriors = tf.nn.softmax(self.crowd_output,
                                                   axis=1)
@@ -59,17 +60,22 @@ class model(object):
 
     def get_crowd_optimizer(self, optimizer_name='SGD'):
         
-        eps = 1e-6
+        eps = 1e-3
         clipped_crowd_posteriors = tf.clip_by_value(
             self.crowd_posteriors,eps,1-eps)
 
-        self.loss = -tf.reduce_mean(tf.reduce_sum(
-            self.crowd_target * tf.log(clipped_crowd_posteriors), axis=0))
+        #vec = tf.nn.softmax_cross_entropy_with_logits_v2(
+        #    logits=self.crowd_output,
+        #    labels=self.crowd_target,
+        #    dim=1)
+
+        vec = -tf.reduce_sum(
+            self.crowd_target * tf.log(clipped_crowd_posteriors), axis=1)
 
         # filtering missing data
-        #mask = tf.equal(self.crowd_target[:,0,:], -2)
-        #zer = tf.zeros-like(full_loss)
-        #self.loss = tf.where(mask,  x=zer, y=full_loss)
+        mask = tf.equal(self.crowd_target[:,0,:], -1)
+        zer = tf.zeros_like(vec)
+        self.loss = tf.where(mask,  x=zer, y=vec)
 
         # optimizer
         # -----------------
@@ -182,9 +188,11 @@ class model(object):
         # (K x 2 x b)
         if succ_probs is None:
             succ_probs = self.compute_succ_probs(Xb)
+        
         else:
             succ_probs = np.repeat(np.expand_dims(succ_probs.T, axis=2),
                                    pies.shape[1], axis=2)
+            
 
         # joints (initialized by the priors)
         joints = pies*1
@@ -201,7 +209,7 @@ class model(object):
             non_eq_indic = np.float32(Lb_tns != ell) * np.float32(Lb_tns>-1)
             joints[ell,:] = joints[ell,:] * \
                             np.prod(succ_probs[:,0,:]**eq_indic, axis=0) * \
-                            np.prod(succ_probs[:,1,:]**non_eq_indic, axis=0)
+                            np.prod((succ_probs[:,1,:]/(self.c-1))**non_eq_indic, axis=0)
 
         return joints / np.sum(joints,axis=0)
         
@@ -227,7 +235,7 @@ class model(object):
 
         # compute the initial confusion matrix, if it's the 
         # first step
-        if self.t==1:
+        if self.t==0:
             succ_probs = self.init_succ_probs
         else:
             succ_probs = None  # should be comptued for each sample
@@ -241,12 +249,16 @@ class model(object):
             rep_posts_b = np.repeat(np.expand_dims(posts_b,axis=0),
                                     self.K, axis=0)
 
-            # the target for the i-th sample:  -p^t(xi) * [1,-1]
+            # the target
             target = np.zeros((self.K, 2, posts_b.shape[1]))
             Zb_tns = np.stack(Zb, axis=0)
             rep_posts_zeroed = rep_posts_b * Zb_tns
-            target[:,0,:] = np.max(rep_posts_zeroed, axis=1)
-            target[:,1,:] = -target[:,0,:]
+            max_posts = np.max(rep_posts_zeroed, axis=1)
+            max_posts[np.max(Zb_tns, axis=1)==0] = -1
+            target[:,0,:] = max_posts
+            max_posts = 1 - max_posts
+            max_posts[np.max(Zb_tns, axis=1)==0] = -1
+            target[:,1,:] = max_posts
             
             feed_dict = {self.model.x: Xb,
                          self.model.keep_prob: 1.,
