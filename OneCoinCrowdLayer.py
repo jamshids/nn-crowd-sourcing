@@ -27,7 +27,7 @@ class model(object):
         if name is None:
             self.name = model.name + '_OneCoinLayer'
 
-    def build_crowd_layers(self):
+    def build_crowd_layers(self, clip_posts=0.):
 
         # dimensionality of the input to the crowd layers
         probed_inputs = list(self.model.probes[0].keys())
@@ -40,9 +40,11 @@ class model(object):
         shape_W = [self.K, 2, du]
         shape_b = [self.K, 2, 1]
         with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
+            self.crowd_global_step = tf.Variable(
+                0, trainable=False, name='crowd_global_step')
             # parameters of the crowd layers
             init_W = np.zeros(shape_W, dtype=np.float32)
-            init_W[:,0,:] = 1.#tf.constant(0., shape=shape_W)
+            #init_W[:,0,:] = 1.#tf.constant(0., shape=shape_W)
             self.crowd_W = tf.get_variable('crowd_W', initializer=init_W)
             init_b = tf.constant(0., shape=shape_b)
             self.crowd_b = tf.get_variable('crowd_b', initializer=init_b)
@@ -52,25 +54,29 @@ class model(object):
             self.crowd_output = tf.keras.backend.dot(self.crowd_W,U) + self.crowd_b
             self.crowd_posteriors = tf.nn.softmax(self.crowd_output,
                                                   axis=1)
+
+            if clip_posts > 0.:
+                self.crowd_clipped_posteriors = tf.clip_by_value(
+                    self.crowd_posteriors,clip_posts,1-clip_posts)
+                self.clip_posts_thr = clip_posts
             
             # get the target placeholder for the crowds
             self.crowd_target = tf.placeholder(tf.float32, 
                                                self.crowd_output.shape)
 
-
-    def get_crowd_optimizer(self, optimizer_name='SGD'):
+    def get_crowd_optimizer(self, learning_rate, optimizer_name='SGD'):
         
-        eps = 1e-3
-        clipped_crowd_posteriors = tf.clip_by_value(
-            self.crowd_posteriors,eps,1-eps)
+        #if hasattr(self, 'crowd_clipped_posteriors'):
+        #    vec = -tf.reduce_sum(
+        #        self.crowd_target * tf.log(self.crowd_clipped_posteriors), axis=1)
+        #else:
+        #    vec = -tf.reduce_sum(
+        #        self.crowd_target * tf.log(self.crowd_posteriors), axis=1)
 
-        #vec = tf.nn.softmax_cross_entropy_with_logits_v2(
-        #    logits=self.crowd_output,
-        #    labels=self.crowd_target,
-        #    dim=1)
-
-        vec = -tf.reduce_sum(
-            self.crowd_target * tf.log(clipped_crowd_posteriors), axis=1)
+        vec = tf.nn.softmax_cross_entropy_with_logits_v2(
+            logits=self.crowd_output,
+            labels=self.crowd_target,
+            dim=1)
 
         # filtering missing data
         mask = tf.equal(self.crowd_target[:,0,:], -1)
@@ -80,15 +86,13 @@ class model(object):
         # optimizer
         # -----------------
         with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            self.crowd_global_step = tf.Variable(
-                0, trainable=False, name='crowd_global_step')
 
             if optimizer_name=='SGD':
                 self.crowd_optimizer = tf.train.GradientDescentOptimizer(
-                    self.model.learning_rate)
+                    learning_rate)
             elif optimizer_name=='Adam':
-                self.crowd_optimizer = tf.train_AdamOptimizer(
-                    self.model.learning_rate)
+                self.crowd_optimizer = tf.train.AdamOptimizer(
+                    learning_rate)
 
             self.crowd_grads_vars = self.crowd_optimizer.compute_gradients(
                 self.loss, [self.crowd_W, self.crowd_b])
@@ -105,7 +109,7 @@ class model(object):
                     if self.name in var.name]
         self.sess.run(tf.variables_initializer(var_list))
 
-    def compute_init_succ_probs(self, non_eternal_dat_gens):
+    def compute_init_succ_probs(self, non_eternal_gen, Z):
         """Computing initial confusion matrices for all the 
         labelers, using the prediction of the current PN model
 
@@ -117,23 +121,25 @@ class model(object):
 
         succ_probs = np.zeros((2, self.K))
 
-        for k, dat_gen in enumerate(non_eternal_dat_gens):
+        # get the prediction of the current model
+        Yhats = []
+        all_inds = []
+        for Xb,_,inds in non_eternal_gen:
+            feed_dict = {self.model.x:Xb, self.model.keep_prob:1.}
+            Yhats += [self.sess.run(self.model.prediction, 
+                                    feed_dict=feed_dict)]
+            all_inds += [inds]
+        
+        Yhats = np.concatenate(Yhats)
+        all_Yhats = np.zeros(len(Yhats))
+        all_inds = np.concatenate(all_inds)
+        all_Yhats[all_inds] = Yhats
 
-            # get the prediction of the current model
-            Z_k = []
-            Yhats_k = []
-            for Xb, Zb, _ in dat_gen:
-                # here, for samples coming from A_k, only labels
-                # of the k-th labeler will be necessary
-                Z_k += [Zb[k]]
-
-                feed_dict = {self.model.x:Xb, self.model.keep_prob:1.}
-                Yhats_k += [self.sess.run(self.model.prediction, 
-                                          feed_dict=feed_dict)]
-            Z_k = np.concatenate(Z_k, axis=1)
-            Yhats_k = np.concatenate(Yhats_k)
-
-            succ_probs[0,k] = np.sum(Yhats_k == np.argmax(Z_k, axis=0))/len(Yhats_k)
+        for k in range(self.K):
+            annot_inds = np.sum(Z[k],axis=0)>0
+            annots = np.argmax(Z[k][:,annot_inds], axis=0)
+            annot_Yhats = all_Yhats[annot_inds]
+            succ_probs[0,k] = np.sum(annot_Yhats == annots)/np.sum(annot_inds)
             succ_probs[1,k] = 1 - succ_probs[0,k]
 
         self.init_succ_probs = succ_probs
@@ -173,6 +179,16 @@ class model(object):
         feed_dict = {self.model.x: Xb, self.model.keep_prob: 1.}
         return self.sess.run(self.crowd_posteriors, feed_dict=feed_dict)
 
+    def compute_clipped_succ_probs(self, Xb):
+        """Computing success probability of all annotators at
+        a given batch of samples
+
+        size of input `Xb`:  d x b
+        size of output    :  K x 2 x b
+        """
+
+        feed_dict = {self.model.x: Xb, self.model.keep_prob: 1.}
+        return self.sess.run(self.crowd_clipped_posteriors, feed_dict=feed_dict)
 
     def compute_Estep_posteriors(self, Xb, Zb, succ_probs=None):
         """Computing E-step posteriors of the ground truth
@@ -187,7 +203,7 @@ class model(object):
         # success probabilities for all annotators
         # (K x 2 x b)
         if succ_probs is None:
-            succ_probs = self.compute_succ_probs(Xb)
+            succ_probs = self.compute_clipped_succ_probs(Xb)
         
         else:
             succ_probs = np.repeat(np.expand_dims(succ_probs.T, axis=2),
@@ -210,13 +226,16 @@ class model(object):
             joints[ell,:] = joints[ell,:] * \
                             np.prod(succ_probs[:,0,:]**eq_indic, axis=0) * \
                             np.prod((succ_probs[:,1,:]/(self.c-1))**non_eq_indic, axis=0)
-
+        
+        if np.any(np.sum(joints,axis=0)==0):
+            pdb.set_trace()
         return joints / np.sum(joints,axis=0)
         
 
     def run_M_step(self,
                    eternal_gen, 
-                   M_iter):
+                   M_iter,
+                   E_posts):
         """ Performing the M-step for few iterations
 
         The input `eternal_gens` is a list of generators with length K+1.
@@ -235,17 +254,18 @@ class model(object):
 
         # compute the initial confusion matrix, if it's the 
         # first step
-        if self.t==0:
-            succ_probs = self.init_succ_probs
-        else:
-            succ_probs = None  # should be comptued for each sample
+        #if self.t==0:
+        #    succ_probs = self.init_succ_probs
+        #else:
+        #    succ_probs = None  # should be comptued for each sample
 
         for _ in range(M_iter):
 
             """ fine-tuning the k-th labeler's head """
             """ ----------------------------------- """
-            Xb, Zb, _ = next(eternal_gen)
-            posts_b = self.compute_Estep_posteriors(Xb, Zb, succ_probs)
+            Xb, Zb, inds = next(eternal_gen)
+            #posts_b = self.compute_Estep_posteriors(Xb, Zb, succ_probs)
+            posts_b = E_posts[:,inds]
             rep_posts_b = np.repeat(np.expand_dims(posts_b,axis=0),
                                     self.K, axis=0)
 
@@ -277,8 +297,11 @@ class model(object):
     def iterate_EM(self, 
                    EM_iter,
                    M_iter,
-                   eternal_gens,
-                   test_non_eternal_gen=None):
+                   eternal_gen,
+                   non_eternal_gen,
+                   test_non_eternal_gen=None,
+                   validation=False,
+                   silent=False):
         """This function takes a list of eternal generators (one
         per annotator) and one non-eternal generator for test data.
 
@@ -290,28 +313,48 @@ class model(object):
 
         if test_non_eternal_gen is not None:
             rep_test_gen = tee(test_non_eternal_gen, EM_iter)
+        rep_non_eternal_gen = tee(non_eternal_gen, EM_iter)
+
         eval_accs = []
         t0 = self.t
         for t in range(self.t, self.t+EM_iter):
             # E-step
-            # we do not do this step explicitly, but save
-            # the weights of the current model in an auxiliary
-            # model so that it can be used to compute the E-step
-            # posteriors of the selected mini-batch samples in
-            # the M-step objective.
-            #self.aux_model.perform_assign_ops(
-            #    self.prev_weights_path, self.sess)
+            if self.t==0:
+                succ_probs = self.init_succ_probs
+            else:
+                succ_probs = None  # should be comptued for each sample
+
+            unordered_E_posts = []
+            all_inds = []
+            for Xb,Zb,inds in rep_non_eternal_gen[t-t0]:
+                posts_b = self.compute_Estep_posteriors(Xb,Zb,succ_probs)
+                unordered_E_posts += [posts_b]
+                all_inds += [inds]
+            all_inds = np.concatenate(all_inds)
+            unordered_E_posts = np.concatenate(unordered_E_posts,axis=1)
+            E_posts = np.zeros(unordered_E_posts.shape)
+            E_posts[:,all_inds] = unordered_E_posts
 
             # M-step
-            self.run_M_step(eternal_gens, M_iter)
+            self.run_M_step(eternal_gen, M_iter, E_posts)
             self.t += 1
 
             # saving the weights
             self.model.save_weights(self.prev_weights_path)
 
             if test_non_eternal_gen is not None:
-                eval_accs += [simple_eval_model(self.model,self.sess,
-                                                rep_test_gen[t-t0])[0]]
-                print('{0:.4f}'.format(eval_accs[-1]), end=', ')
+                acc_t = simple_eval_model(self.model,self.sess,
+                                          rep_test_gen[t-t0])[0]
+                eval_accs += [acc_t]
+
+                if validation:
+                    if np.max(eval_accs)==acc_t:
+                        valid_path = os.path.join(
+                            os.path.dirname(self.prev_weights_path),
+                            'valid_weights.h5')
+                        self.model.save_weights(valid_path)
+
+                if not(silent):
+                    print('{0:.4f}'.format(eval_accs[-1]), end=', ')
 
         return eval_accs
