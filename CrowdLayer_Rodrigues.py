@@ -26,19 +26,20 @@ class model(object):
         """
 
         shape_W = [self.K, self.c, self.c]
-        shape_b = [self.K, self.c, 1]
+        #shape_b = [self.K, self.c, 1]
+
         with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
             # parameters of the crowd layers
             init_W = np.stack([np.eye(self.c, dtype=np.float32) 
                                for k in range(self.K)], axis=0)
             self.crowd_W = tf.get_variable('crowd_W', initializer=init_W)
-            init_b = tf.constant(0., shape=shape_b)
-            self.crowd_b = tf.get_variable('crowd_b', initializer=init_b)
+            #init_b = tf.constant(0., shape=shape_b)
+            #self.crowd_b = tf.get_variable('crowd_b', initializer=init_b)
 
             # output of the crowd layers 
             # (K x 2 x b)
             self.crowd_output = tf.keras.backend.dot(
-                self.crowd_W, self.model.posteriors) + self.crowd_b
+                self.crowd_W, self.model.posteriors)
             self.crowd_posteriors = tf.nn.softmax(self.crowd_output,
                                                   axis=1)
             
@@ -56,7 +57,7 @@ class model(object):
         in all the crowd layers.
         """
 
-        with tf.variable_scope(self.name):
+        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
 
             self.global_step = tf.Variable(0, 
                                            trainable=False, 
@@ -65,7 +66,7 @@ class model(object):
             vec = tf.nn.softmax_cross_entropy_with_logits_v2(
                 logits=self.crowd_output,
                 labels=self.crowd_target,
-                dim=1)            
+                dim=1)
             mask = tf.equal(self.crowd_target[:,0,:], -1)
             zer = tf.zeros_like(vec)
             self.loss = tf.where(mask, x=zer, y=vec)
@@ -81,7 +82,7 @@ class model(object):
             train_vars = [V[i] for _,V in self.model.var_dict.items()
                           for i in range(len(V)) if V[i] in 
                           tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)]
-            train_vars += [self.crowd_W, self.crowd_b]
+            train_vars += [self.crowd_W]
             self.grads_vars = self.optimizer.compute_gradients(self.loss, train_vars)
 
             update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
