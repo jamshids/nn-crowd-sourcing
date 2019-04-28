@@ -81,8 +81,11 @@ class model(object):
         # filtering missing data
         mask = tf.equal(self.crowd_target[:,0,:], -1)
         zer = tf.zeros_like(vec)
-        self.loss = tf.where(mask,  x=zer, y=vec)
+        self.crowd_loss = tf.where(mask,  x=zer, y=vec)
 
+        self.total_loss = tf.add(self.model.loss, 
+                                 tf.reduce_mean(tf.reduce_mean(self.crowd_loss, axis=1)))
+        
         # optimizer
         # -----------------
         with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
@@ -94,8 +97,12 @@ class model(object):
                 self.crowd_optimizer = tf.train.AdamOptimizer(
                     learning_rate)
 
+
+            #BN_vars = [v for _,v in self.model.var_dict.items()  
+            #           if 'last' not in v[0].name]
+            PN_vars = [v[1] for v in self.model.grads_vars]
             self.crowd_grads_vars = self.crowd_optimizer.compute_gradients(
-                self.loss, [self.crowd_W, self.crowd_b])
+                self.total_loss, PN_vars + [self.crowd_W, self.crowd_b])
 
             update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
             with tf.control_dependencies(update_ops):
@@ -206,8 +213,9 @@ class model(object):
             succ_probs = self.compute_clipped_succ_probs(Xb)
         
         else:
-            succ_probs = np.repeat(np.expand_dims(succ_probs.T, axis=2),
-                                   pies.shape[1], axis=2)
+            if succ_probs.ndim==2:
+                succ_probs = np.repeat(np.expand_dims(succ_probs.T, axis=2),
+                                       pies.shape[1], axis=2)
             
 
         # joints (initialized by the priors)
@@ -281,17 +289,21 @@ class model(object):
             target[:,1,:] = max_posts
             
             feed_dict = {self.model.x: Xb,
-                         self.model.keep_prob: 1.,
+                         self.model.y_: posts_b,
+                         self.model.keep_prob: 1-self.model.dropout_rate,
                          self.crowd_target: target}
 
             self.sess.run(self.crowd_train_step, feed_dict=feed_dict)
 
-            """ fine-tuning the prior-net """
-            """ ------------------------- """
-            feed_dict = {self.model.x: Xb, 
-                         self.model.y_: posts_b,
-                         self.model.keep_prob: 1-self.model.dropout_rate}
-            self.sess.run(self.model.train_step, feed_dict=feed_dict)
+
+        #for _ in range(M_iter):
+
+        #    """ fine-tuning the prior-net """
+        #    """ ------------------------- """
+        #    feed_dict = {self.model.x: Xb, 
+        #                 self.model.y_: posts_b,
+        #                 self.model.keep_prob: 1-self.model.dropout_rate}
+        #    self.sess.run(self.model.train_step, feed_dict=feed_dict)
 
 
     def iterate_EM(self, 
@@ -345,7 +357,9 @@ class model(object):
             if test_non_eternal_gen is not None:
                 acc_t = simple_eval_model(self.model,self.sess,
                                           rep_test_gen[t-t0])[0]
-                eval_accs += [acc_t]
+                train_acc_t = np.sum(np.argmax(E_posts,axis=0)
+                                     ==np.argmax(self.Y, axis=0))/self.Y.shape[1]
+                eval_accs += [(acc_t, train_acc_t)]
 
                 if validation:
                     if np.max(eval_accs)==acc_t:
@@ -355,6 +369,7 @@ class model(object):
                         self.model.save_weights(valid_path)
 
                 if not(silent):
-                    print('{0:.4f}'.format(eval_accs[-1]), end=', ')
+                    print('({0:.4f}, {1:.4f})'.format(eval_accs[-1][0], eval_accs[-1][1]), end=', ')
 
         return eval_accs
+
